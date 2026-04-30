@@ -15,22 +15,56 @@ from datetime import datetime
 
 def _detect_revenue_col(df: pd.DataFrame) -> str | None:
     numeric = df.select_dtypes(include=[np.number]).columns.tolist()
-    for c in numeric:
-        if any(k in c.lower() for k in ["revenue", "sales", "amount", "total", "price", "sale", "value", "income"]):
-            return c
+    priorities = [
+        ["revenue"],
+        ["total", "amount", "sales", "sale", "income"],
+        ["price", "value"]
+    ]
+    for p_list in priorities:
+        for c in numeric:
+            if any(k in c.lower() for k in p_list):
+                return c
     return numeric[0] if numeric else None
 
 
 def _detect_date_col(df: pd.DataFrame) -> str | None:
+    # 1. Prefer the synthetic column injected by data_cleaner
+    if "__date__" in df.columns and pd.api.types.is_datetime64_any_dtype(df["__date__"]):
+        return "__date__"
+
+    # 2. Any column already parsed as datetime
     for c in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[c]):
             return c
-        if any(k in c.lower() for k in ["date", "time", "month", "year", "period"]):
+
+    # 3. String column whose name suggests a date and that parses cleanly
+    for c in df.columns:
+        if any(k in c.lower() for k in ["date", "time", "period"]):
             try:
-                pd.to_datetime(df[c], errors="raise")
-                return c
+                parsed = pd.to_datetime(df[c], errors="coerce")
+                if parsed.notna().sum() / max(len(df), 1) > 0.5:
+                    df[c] = parsed      # coerce in-place so downstream code works
+                    return c
             except Exception:
                 pass
+
+    # 4. Reconstruct from integer year / month / day columns
+    _year_col  = next((c for c in df.columns if c.lower() == "year"),  None)
+    _month_col = next((c for c in df.columns if c.lower() == "month"), None)
+    _day_col   = next((c for c in df.columns if c.lower() == "day"),   None)
+    if _year_col and _month_col:
+        try:
+            _day_s = df[_day_col] if _day_col else 1
+            reconstructed = pd.to_datetime(
+                dict(year=df[_year_col], month=df[_month_col], day=_day_s),
+                errors="coerce"
+            )
+            if reconstructed.notna().sum() / max(len(df), 1) > 0.5:
+                df["__date__"] = reconstructed
+                return "__date__"
+        except Exception:
+            pass
+
     return None
 
 
@@ -157,25 +191,72 @@ def analyze_data(df: pd.DataFrame) -> dict:
     if date_col and rev_col:
         try:
             temp = df[[date_col, rev_col]].copy()
-            temp[date_col] = pd.to_datetime(temp[date_col], errors="coerce")
-            temp = temp.dropna(subset=[date_col])
-            temp = temp.set_index(date_col).sort_index()
-            monthly = temp[rev_col].resample("M").sum()
+            # Only convert if not already a datetime column (e.g. __date__ from cleaner)
+            if not pd.api.types.is_datetime64_any_dtype(temp[date_col]):
+                temp[date_col] = pd.to_datetime(temp[date_col], errors="coerce")
+            temp = temp.dropna(subset=[date_col, rev_col])
+            
+            # Robust generic aggregation step
+            monthly = temp.groupby(temp[date_col].dt.to_period('M'))[rev_col].sum()
+            monthly = monthly.sort_index()
+
+            print("=======================================")
+            print("MANDATORY VALIDATION: Monthly Revenue")
+            print(monthly)
+            print("=======================================")
+
+            if monthly.empty or monthly.sum() == 0:
+                print("WARNING: Aggregation resulted in zero or empty data!")
+            else:
+                first_month = temp[date_col].dt.to_period('M').min()
+                subset = temp[temp[date_col].dt.to_period('M') == first_month]
+                print("First month rows:", len(subset))
+                print("First month revenue:", subset[rev_col].sum())
+                print("=======================================")
+
             if len(monthly) > 0:
-                labels = [d.strftime("%b %Y") for d in monthly.index]
+                # dt.to_period('M') index can be converted to timestamp for formatting
+                labels = [d.to_timestamp().strftime("%b %Y") for d in monthly.index]
                 values = [round(float(v), 2) for v in monthly.values]
-                # Growth rate: first vs last period
+                
+                # Ensure complete data usage validation
+                assert abs(monthly.sum() - temp[rev_col].sum()) < 0.1, "Mismatch in total revenue aggregation"
+
+                # Trend interpretation and Growth Rate
+                trend_label = "insufficient data"
+                if len(values) >= 3:
+                    v1, v2, v3 = values[0], values[1], values[2]
+                    print("First Month:", v1)
+                    print("Second Month:", v2)
+                    print("Third Month:", v3)
+                    
+                    if v2 < v1 and v3 > v2:
+                        trend_label = "decline followed by recovery"
+                    elif v2 > v1 and v3 < v2:
+                        trend_label = "growth followed by decline"
+                    elif v3 > v2 > v1:
+                        trend_label = "consistent growth"
+                    elif v3 < v2 < v1:
+                        trend_label = "consistent decline"
+                    else:
+                        trend_label = "fluctuating trend"
+                elif len(values) == 2:
+                    trend_label = "growth" if values[1] > values[0] else "decline"
+
                 if len(values) >= 2 and values[0] != 0:
                     growth = round(((values[-1] - values[0]) / values[0]) * 100, 2)
                     if result["kpis"]:
                         result["kpis"]["growth_rate_pct"] = growth
+                        result["kpis"]["trend_interpretation"] = trend_label
+
                 result["trend"] = {
                     "date_column": date_col,
                     "frequency": "monthly",
                     "labels": labels,
                     "values": values,
                     "peak_period": labels[int(np.argmax(values))] if values else None,
-                    "peak_value": max(values) if values else None
+                    "peak_value": max(values) if values else None,
+                    "trend_label": trend_label
                 }
         except Exception as e:
             result["trend"] = {"error": str(e)}
@@ -245,7 +326,8 @@ def analyze_data(df: pd.DataFrame) -> dict:
         k = result["kpis"]
         lines.append(f"Revenue column: '{rev_col}'. Total: ${k['total']:,.2f}, Mean: ${k['mean']:,.2f}, Max: ${k['max']:,.2f}.")
         if k["growth_rate_pct"] is not None:
-            lines.append(f"Overall growth rate (first→last period): {k['growth_rate_pct']}%.")
+            trend_desc = k.get("trend_interpretation", "unknown trend")
+            lines.append(f"Overall growth rate (first→last period): {k['growth_rate_pct']}%. The general trend shows a {trend_desc}.")
     if result["performers"]:
         p = result["performers"]
         top_names = ", ".join(x["name"] for x in p["top"][:3])
