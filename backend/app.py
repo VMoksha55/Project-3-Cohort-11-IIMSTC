@@ -1,148 +1,106 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from fastapi.middleware.cors import CORSMiddleware
+from flask import Flask, request, jsonify, render_template, send_from_directory
 import pickle
-import pandas as pd
 import os
+import pandas as pd
 
-from database import SessionLocal, Sales, Sentiment
+app = Flask(__name__)
 
-app = FastAPI()
+# 🔷 Load models - path to parent folder's models
+MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'models', 'models')
+sentiment_model = pickle.load(open(os.path.join(MODEL_PATH, 'sentiment_model.pkl'), 'rb'))
+tfidf_vectorizer = pickle.load(open(os.path.join(MODEL_PATH, 'tfidf_vectorizer.pkl'), 'rb'))
+sales_model = pickle.load(open(os.path.join(MODEL_PATH, 'sales_model.pkl'), 'rb'))
 
-# 🔥 CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 🔥 LOAD MODELS
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sentiment_model = pickle.load(open(os.path.join(BASE_DIR, "models", "models", "sentiment_model.pkl"), "rb"))
-vectorizer = pickle.load(open(os.path.join(BASE_DIR, "models", "models", "tfidf_vectorizer.pkl"), "rb"))
-sales_model = pickle.load(open(os.path.join(BASE_DIR, "models", "models", "sales_model.pkl"), "rb"))
-
-# 🔷 INPUT VALIDATION
-
-class Review(BaseModel):
-    review: str = Field(
-        example="This product is amazing",
-        description="Customer review text"
-    )
-
-class SalesInput(BaseModel):
-    units: float = Field(gt=0, example=5)
-    price: float = Field(gt=0, example=100)
-    rating: float = Field(ge=1, le=5, example=4.5)
-
-# 🔷 HOME
-@app.get("/")
+# 🔷 FRONTEND ROUTES
+@app.route('/')
 def home():
-    return {"message": "SmartBIZ API Running"}
+    return render_template('index.html')
+
+@app.route('/dashboard')
+def dashboard():
+    return render_template('dashboard.html')
+
+@app.route('/static/<path:filename>')
+def static_files(filename):
+    return send_from_directory(os.path.join(os.path.dirname(__file__), '..', 'frontend'), filename)
+
+# 🔷 COMBINED ANALYZE API (for frontend compatibility)
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    data = request.get_json()
+    text = data.get('text', '')
+    price = float(data.get('price', 0))
+    
+    # Sentiment
+    vector = tfidf_vectorizer.transform([text])
+    sentiment = sentiment_model.predict(vector)[0]
+    confidence = sentiment_model.predict_proba(vector).max()
+    
+    # Sales
+    from datetime import datetime
+    now = datetime.now()
+    df = pd.DataFrame([{
+        'Unit Price': price,
+        'year': now.year,
+        'month': now.month,
+        'day': now.day,
+        'Product Category_Books': 0,
+        'Product Category_Clothing': 0,
+        'Product Category_Electronics': 0,
+        'Product Category_Home Appliances': 0,
+        'Product Category_Sports': 0,
+        'Region_Europe': 0,
+        'Region_North America': 0,
+        'Payment Method_Debit Card': 0,
+        'Payment Method_PayPal': 0
+    }])
+    prediction = sales_model.predict(df)[0]
+    
+    return jsonify({
+        'sentiment': sentiment,
+        'confidence': round(confidence, 2),
+        'sales_prediction': round(prediction, 2)
+    })
 
 # 🔷 SENTIMENT API
-@app.post("/predict-sentiment")
-def predict_sentiment(data: Review):
+@app.route('/predict-sentiment', methods=['POST'])
+def predict_sentiment():
+    data = request.get_json()
+    review = data['review']
 
-    vector = vectorizer.transform([data.review])
+    vector = tfidf_vectorizer.transform([review])
     prediction = sentiment_model.predict(vector)[0]
 
-    db = SessionLocal()
-
-    entry = Sentiment(
-        review=data.review,
-        sentiment=prediction
-    )
-
-    db.add(entry)
-    db.commit()
-    db.close()
-
-    return {
-        "status": "success",
-        "message": "Sentiment predicted",
-        "data": {
-            "sentiment": prediction
-        }
-    }
+    return jsonify({'sentiment': prediction})
 
 # 🔷 SALES API
-@app.post("/predict-sales")
-def predict_sales(data: SalesInput):
+@app.route('/predict-sales', methods=['POST'])
+def predict_sales():
+    data = request.get_json()
+    from datetime import datetime
+    now = datetime.now()
 
-    if data.units <= 0:
-        raise HTTPException(status_code=400, detail="Units must be > 0")
-
+    # Create feature vector with all 13 features the model expects
     df = pd.DataFrame([{
-        "Units Sold": data.units,
-        "Unit Price": data.price,
-        "Rating": data.rating
+        'Unit Price': float(data.get('unit_price', 0)),
+        'year': now.year,
+        'month': now.month,
+        'day': now.day,
+        'Product Category_Books': 0,
+        'Product Category_Clothing': 0,
+        'Product Category_Electronics': 0,
+        'Product Category_Home Appliances': 0,
+        'Product Category_Sports': 0,
+        'Region_Europe': 0,
+        'Region_North America': 0,
+        'Payment Method_Debit Card': 0,
+        'Payment Method_PayPal': 0
     }])
 
     prediction = sales_model.predict(df)[0]
 
-    db = SessionLocal()
+    return jsonify({'predicted_revenue': round(prediction, 2)})
 
-    entry = Sales(
-        units=data.units,
-        price=data.price,
-        rating=data.rating,
-        predicted_revenue=float(prediction)
-    )
-
-    db.add(entry)
-    db.commit()
-    db.close()
-
-    return {
-        "status": "success",
-        "message": "Sales predicted",
-        "data": {
-            "predicted_revenue": float(prediction)
-        }
-    }
-
-# 🔷 DASHBOARD API (REAL DATA)
-@app.get("/dashboard-data")
-def dashboard_data():
-
-    db = SessionLocal()
-
-    sales = db.query(Sales).all()
-    sentiments = db.query(Sentiment).all()
-
-    db.close()
-
-    revenue = [s.predicted_revenue for s in sales]
-
-    pos = sum(1 for s in sentiments if s.sentiment == "Positive")
-    neg = sum(1 for s in sentiments if s.sentiment == "Negative")
-    neu = sum(1 for s in sentiments if s.sentiment == "Neutral")
-
-    return {
-        "revenue_over_time": revenue,
-        "dates": list(range(len(revenue))),
-        "sentiment": {
-            "positive": pos,
-            "neutral": neu,
-            "negative": neg
-        }
-    }
-
-# 🔷 MODEL PERFORMANCE API
-@app.get("/model-performance")
-def model_performance():
-    return {
-        "sentiment_models": {
-            "Logistic Regression": 0.85,
-            "Naive Bayes": 0.82,
-            "Random Forest": 0.88
-        },
-        "sales_models": {
-            "Linear Regression": 0.76,
-            "Random Forest": 0.91
-        }
-    }
-
+# 🔷 RUN SERVER
+if __name__ == '__main__':
+    app.run(debug=True)
